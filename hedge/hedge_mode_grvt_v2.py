@@ -41,8 +41,8 @@ class HedgeBot:
         self.lighter_order_filled = False
         self.current_order = {}
         self.max_position = max_position
-        self.spread_history = deque(maxlen=2000)
-        self.spread_window = 2000
+        self.spread_history = deque(maxlen=1000)
+        self.spread_window = 1000
         self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '2'))
         self.close_sigma = Decimal(os.getenv('GRVT_CLOSE_SIGMA', '0.5'))
 
@@ -1431,6 +1431,13 @@ class HedgeBot:
                     self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
 
             else:
+                self.logger.info(
+                    f"No trade signal | spread={float(spread):.6f}, "
+                    f"long_thr>{float(long_grvt_threshold):.6f}, short_thr<{float(short_grvt_threshold):.6f}, "
+                    f"close_upper={float(close_upper) if close_upper is not None else 'N/A'}, "
+                    f"close_lower={float(close_lower) if close_lower is not None else 'N/A'}, "
+                    f"GRVT pos={self.grvt_position}, Lighter pos={self.lighter_position}"
+                )
                 await asyncio.sleep(1)
 
     async def run(self):
