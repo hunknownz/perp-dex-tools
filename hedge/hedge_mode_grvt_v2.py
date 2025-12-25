@@ -42,6 +42,9 @@ class HedgeBot:
         self.current_order = {}
         self.max_position = max_position
         self.spread_history = deque(maxlen=2000)
+        self.spread_window = 2000
+        self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '2'))
+        self.close_sigma = Decimal(os.getenv('GRVT_CLOSE_SIGMA', '0.5'))
 
         self.exp_grvt_price = 0
         self.exp_lighter_price = 0
@@ -336,14 +339,28 @@ class HedgeBot:
                 pass
             self._initialize_bbo_csv_file()
 
-    def log_thresholds_to_json(self, long_grvt_threshold: Decimal, short_grvt_threshold: Decimal):
+    def log_thresholds_to_json(self,
+                              mean_val: Decimal,
+                              std_val: Decimal,
+                              open_sigma: Decimal,
+                              close_sigma: Decimal,
+                              long_grvt_threshold: Decimal,
+                              short_grvt_threshold: Decimal,
+                              close_upper: Decimal,
+                              close_lower: Decimal):
         """Log threshold values to JSON file."""
         try:
             timestamp = datetime.now(pytz.UTC).isoformat()
             thresholds_data = {
                 "timestamp": timestamp,
+                "mean": float(mean_val),
+                "std": float(std_val),
+                "open_sigma": float(open_sigma),
+                "close_sigma": float(close_sigma),
                 "long_grvt_threshold": float(long_grvt_threshold),
-                "short_grvt_threshold": float(short_grvt_threshold)
+                "short_grvt_threshold": float(short_grvt_threshold),
+                "close_upper": float(close_upper) if close_upper is not None else None,
+                "close_lower": float(close_lower) if close_lower is not None else None
             }
             with open(self.thresholds_json_filename, 'w') as json_file:
                 json.dump(thresholds_data, json_file, indent=2)
@@ -1295,21 +1312,89 @@ class HedgeBot:
 
             self.spread_history.append(self.lighter_best_bid - self.grvt_best_bid)
 
-            if len(self.spread_history) > 1000:
+            close_upper = None
+            close_lower = None
+
+            if len(self.spread_history) > self.spread_window:
                 data = list(self.spread_history)
-                median_val = statistics.median(data)
-                long_grvt_threshold = median_val + self.grvt_best_ask * Decimal("0.0002")
-                short_grvt_threshold = -(median_val - self.grvt_best_ask * Decimal("0.0002"))
+                mean_val = Decimal(str(statistics.mean(data)))
+                std_val = Decimal(str(statistics.pstdev(data))) if len(data) > 1 else Decimal('0')
+
+                if std_val == 0:
+                    await asyncio.sleep(1)
+                    continue
+
+                long_grvt_threshold = mean_val + (self.open_sigma * std_val)
+                short_grvt_threshold = mean_val - (self.open_sigma * std_val)
+                close_upper = mean_val + (self.close_sigma * std_val)
+                close_lower = mean_val - (self.close_sigma * std_val)
                 # Log thresholds to JSON file
-                self.log_thresholds_to_json(long_grvt_threshold, short_grvt_threshold)
+                self.log_thresholds_to_json(
+                    mean_val,
+                    std_val,
+                    self.open_sigma,
+                    self.close_sigma,
+                    long_grvt_threshold,
+                    short_grvt_threshold,
+                    close_upper,
+                    close_lower
+                )
             else:
                 if log_position:
-                    self.logger.info(f"logging spread history. {len(self.spread_history)}/1000")
+                    self.logger.info(f"logging spread history. {len(self.spread_history)}/{self.spread_window}")
                     self.logger.info(f"best bid: {self.lighter_best_bid} | best ask: {self.lighter_best_ask}")
                 await asyncio.sleep(1)
                 continue            
             long_grvt = False
             short_grvt = False
+            spread = self.lighter_best_bid - self.grvt_best_bid
+
+            close_long = (
+                close_upper is not None and
+                self.grvt_position > 0 and
+                self.lighter_position < 0 and
+                spread <= close_upper
+            )
+
+            close_short = (
+                close_lower is not None and
+                self.grvt_position < 0 and
+                self.lighter_position > 0 and
+                spread >= close_lower
+            )
+
+            if close_long:
+                order_quantity = min(
+                    self.order_quantity,
+                    self.grvt_best_bid_size,
+                    abs(self.grvt_position)
+                )
+                try:
+                    await asyncio.gather(
+                        self.place_grvt_market_order('sell', order_quantity),
+                        self.place_lighter_market_order('buy', order_quantity)
+                    )
+                except Exception as e:
+                    self.logger.error(f"⚠️ Error closing long bias: {e}")
+                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                continue
+
+            if close_short:
+                order_quantity = min(
+                    self.order_quantity,
+                    self.grvt_best_ask_size,
+                    abs(self.grvt_position)
+                )
+                try:
+                    await asyncio.gather(
+                        self.place_grvt_market_order('buy', order_quantity),
+                        self.place_lighter_market_order('sell', order_quantity)
+                    )
+                except Exception as e:
+                    self.logger.error(f"⚠️ Error closing short bias: {e}")
+                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                continue
+
             if self.lighter_best_bid and self.grvt_best_ask and self.lighter_best_bid - self.grvt_best_ask > long_grvt_threshold and self.grvt_position <= self.max_position:
                 self.exp_grvt_price = self.grvt_best_ask
                 self.exp_lighter_price = self.lighter_best_bid
