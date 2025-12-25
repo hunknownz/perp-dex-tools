@@ -41,10 +41,10 @@ class HedgeBot:
         self.lighter_order_filled = False
         self.current_order = {}
         self.max_position = max_position
-        self.spread_history = deque(maxlen=1000)
-        self.spread_window = 1000
-        self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '2'))
-        self.close_sigma = Decimal(os.getenv('GRVT_CLOSE_SIGMA', '0.5'))
+        self.spread_history = deque(maxlen=200)
+        self.spread_window = 200
+        self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '1.2'))
+        self.close_sigma = Decimal(os.getenv('GRVT_CLOSE_SIGMA', '0.4'))
 
         self.exp_grvt_price = 0
         self.exp_lighter_price = 0
@@ -858,6 +858,27 @@ class HedgeBot:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             return None
 
+    async def execute_pair(self, grvt_side: str, lighter_side: str, quantity: Decimal, context: str) -> bool:
+        """Execute GRVT leg first, then Lighter leg to avoid single-sided exposure."""
+        try:
+            await self.place_grvt_market_order(grvt_side, quantity)
+        except Exception as e:
+            self.logger.error(f"[{context}] ❌ GRVT leg failed: {e}")
+            return False
+
+        try:
+            await self.place_lighter_market_order(lighter_side, quantity)
+            return True
+        except Exception as e:
+            self.logger.error(f"[{context}] ❌ Lighter leg failed: {e}")
+            unwind_side = 'sell' if grvt_side.lower() == 'buy' else 'buy'
+            try:
+                await self.place_grvt_market_order(unwind_side, quantity)
+                self.logger.warning(f"[{context}] ⚠️ Lighter leg failed - unwound GRVT leg with {unwind_side} {quantity}")
+            except Exception as unwind_err:
+                self.logger.error(f"[{context}] ❌ Failed to unwind GRVT leg: {unwind_err}")
+            return False
+
     async def monitor_lighter_order(self, client_order_index: int):
         """Monitor Lighter order and adjust price if needed."""
 
@@ -1315,7 +1336,7 @@ class HedgeBot:
             close_upper = None
             close_lower = None
 
-            if len(self.spread_history) > self.spread_window:
+            if len(self.spread_history) >= self.spread_window:
                 data = list(self.spread_history)
                 mean_val = Decimal(str(statistics.mean(data)))
                 std_val = Decimal(str(statistics.pstdev(data))) if len(data) > 1 else Decimal('0')
@@ -1369,14 +1390,7 @@ class HedgeBot:
                     self.grvt_best_bid_size,
                     abs(self.grvt_position)
                 )
-                try:
-                    await asyncio.gather(
-                        self.place_grvt_market_order('sell', order_quantity),
-                        self.place_lighter_market_order('buy', order_quantity)
-                    )
-                except Exception as e:
-                    self.logger.error(f"⚠️ Error closing long bias: {e}")
-                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                await self.execute_pair('sell', 'buy', order_quantity, context='close_long')
                 continue
 
             if close_short:
@@ -1385,57 +1399,67 @@ class HedgeBot:
                     self.grvt_best_ask_size,
                     abs(self.grvt_position)
                 )
-                try:
-                    await asyncio.gather(
-                        self.place_grvt_market_order('buy', order_quantity),
-                        self.place_lighter_market_order('sell', order_quantity)
-                    )
-                except Exception as e:
-                    self.logger.error(f"⚠️ Error closing short bias: {e}")
-                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                await self.execute_pair('buy', 'sell', order_quantity, context='close_short')
                 continue
 
-            if self.lighter_best_bid and self.grvt_best_ask and self.lighter_best_bid - self.grvt_best_ask > long_grvt_threshold and self.grvt_position <= self.max_position:
+            long_fail_reasons = []
+            short_fail_reasons = []
+
+            long_diff = None
+            short_diff = None
+
+            if self.lighter_best_bid is None or self.grvt_best_ask is None:
+                long_fail_reasons.append("missing lighter bid or grvt ask")
+            else:
+                long_diff = self.lighter_best_bid - self.grvt_best_ask
+                if long_diff <= long_grvt_threshold:
+                    long_fail_reasons.append(
+                        f"spread {float(long_diff):.6f} <= long_thr {float(long_grvt_threshold):.6f}"
+                    )
+            if self.grvt_position > self.max_position:
+                long_fail_reasons.append(
+                    f"grvt pos {self.grvt_position} exceeds max {self.max_position}"
+                )
+
+            if self.grvt_best_bid is None or self.lighter_best_ask is None:
+                short_fail_reasons.append("missing grvt bid or lighter ask")
+            else:
+                short_diff = self.grvt_best_bid - self.lighter_best_ask
+                if short_diff <= short_grvt_threshold:
+                    short_fail_reasons.append(
+                        f"spread {float(short_diff):.6f} <= short_thr {float(short_grvt_threshold):.6f}"
+                    )
+            if self.grvt_position < -1 * self.max_position:
+                short_fail_reasons.append(
+                    f"grvt pos {self.grvt_position} below -max {-1 * self.max_position}"
+                )
+
+            if not long_fail_reasons:
                 self.exp_grvt_price = self.grvt_best_ask
                 self.exp_lighter_price = self.lighter_best_bid
                 long_grvt = True
-            elif self.grvt_best_bid and self.lighter_best_ask and self.grvt_best_bid - self.lighter_best_ask > short_grvt_threshold and self.grvt_position >= -1*self.max_position:
+            elif not short_fail_reasons:
                 self.exp_grvt_price = self.grvt_best_bid
                 self.exp_lighter_price = self.lighter_best_ask
                 short_grvt = True
 
             if long_grvt:
                 order_quantity = min(self.order_quantity, self.grvt_best_ask_size)
-
-                try:
-                    # Place both trades concurrently
-                    await asyncio.gather(
-                        self.place_grvt_market_order('buy', order_quantity),
-                        self.place_lighter_market_order('sell', order_quantity)
-                    )
-                except Exception as e:
-                    self.logger.error(f"⚠️ Error in trading loop: {e}")
-                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                await self.execute_pair('buy', 'sell', order_quantity, context='open_long')
 
             elif short_grvt:
                 order_quantity = min(self.order_quantity, self.grvt_best_bid_size)
-
-                try:
-                    # Place both trades concurrently
-                    await asyncio.gather(
-                        self.place_grvt_market_order('sell', order_quantity),
-                        self.place_lighter_market_order('buy', order_quantity)
-                    )
-                except Exception as e:
-                    self.logger.error(f"⚠️ Error in trading loop: {e}")
-                    self.logger.error(f"⚠️ Full traceback: {traceback.format_exc()}")
+                await self.execute_pair('sell', 'buy', order_quantity, context='open_short')
 
             else:
                 self.logger.info(
-                    f"No trade signal | spread={float(spread):.6f}, "
-                    f"long_thr>{float(long_grvt_threshold):.6f}, short_thr<{float(short_grvt_threshold):.6f}, "
+                    f"No trade | spread_bb={float(spread):.6f}, long_diff={float(long_diff) if long_diff is not None else 'N/A'}, "
+                    f"short_diff={float(short_diff) if short_diff is not None else 'N/A'}, "
+                    f"long_thr={float(long_grvt_threshold):.6f}, short_thr={float(short_grvt_threshold):.6f}, "
                     f"close_upper={float(close_upper) if close_upper is not None else 'N/A'}, "
                     f"close_lower={float(close_lower) if close_lower is not None else 'N/A'}, "
+                    f"long_fail={'; '.join(long_fail_reasons) if long_fail_reasons else 'n/a'}, "
+                    f"short_fail={'; '.join(short_fail_reasons) if short_fail_reasons else 'n/a'}, "
                     f"GRVT pos={self.grvt_position}, Lighter pos={self.lighter_position}"
                 )
                 await asyncio.sleep(1)

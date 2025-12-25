@@ -290,16 +290,45 @@ class GrvtClient(BaseExchangeClient):
 
     async def place_market_order(self, contract_id: str, quantity: Decimal, side: str) -> OrderResult:
         """Place a market order with GRVT using official SDK."""
+        try:
+            order_result = self.rest_client.create_order(
+                symbol=contract_id,
+                order_type='market',
+                side=side,
+                amount=quantity
+            )
+            self.logger.log(
+                f"GRVT market order response | side={side} qty={quantity} result={order_result}",
+                "INFO"
+            )
+        except Exception as e:
+            self.logger.log(
+                f"GRVT market order exception | side={side} qty={quantity}: {e}",
+                "ERROR"
+            )
+            raise
 
-        # Place the order using GRVT SDK
-        order_result = self.rest_client.create_order(
-            symbol=contract_id,
-            order_type='market',
-            side=side,
-            amount=quantity
-        )
         if not order_result:
-            raise Exception(f"[OPEN] Error placing order")
+            msg = f"[OPEN] Error placing order - empty response"
+            self.logger.log(msg, "ERROR")
+            raise Exception(msg)
+
+        status = (
+            order_result.get('status')
+            or order_result.get('state', {}).get('status')
+            or order_result.get('state', {}).get('order_status')
+        )
+        if status and status.upper() == 'REJECTED':
+            failure_reason = (
+                order_result.get('state', {}).get('failure_reason')
+                or order_result.get('error', {}).get('message')
+                or 'unknown reason'
+            )
+            err_msg = f"[OPEN] Error placing order: {failure_reason}"
+            self.logger.log(err_msg, "ERROR")
+            raise Exception(err_msg)
+
+        return order_result
 
     async def get_order_price(self, direction: str) -> Decimal:
         """Get the price of an order with GRVT using official SDK."""
