@@ -500,12 +500,13 @@ class HedgeBot:
             # For sell orders, decrease price to improve fill probability
             return original_price - adjustment
 
-    def calculate_fee_buffer(self, grvt_price: Decimal, lighter_price: Decimal) -> Decimal:
-        """Estimate per-unit spread consumed by fees and slippage."""
-        if grvt_price is None or lighter_price is None:
+    def calculate_fee_buffer(self, grvt_price: Decimal, lighter_price: Decimal, quantity: Decimal) -> Decimal:
+        """Estimate per-unit spread consumed by fees (per traded unit) and slippage."""
+        if grvt_price is None or lighter_price is None or quantity is None or quantity <= 0:
             return Decimal('0')
-        fee_component = (grvt_price * self.grvt_fee_rate) + (lighter_price * self.lighter_fee_rate)
-        return fee_component + self.slippage_buffer
+        total_fee = (grvt_price * self.grvt_fee_rate * quantity) + (lighter_price * self.lighter_fee_rate * quantity)
+        per_unit_fee = total_fee / quantity
+        return per_unit_fee + self.slippage_buffer
 
     async def request_fresh_snapshot(self, ws):
         """Request fresh order book snapshot."""
@@ -1427,11 +1428,15 @@ class HedgeBot:
             long_diff = None
             short_diff = None
 
+            long_qty = self.order_quantity
+            if getattr(self, 'grvt_best_ask_size', None):
+                long_qty = min(long_qty, self.grvt_best_ask_size)
+
             if self.lighter_best_bid is None or self.grvt_best_ask is None:
                 long_fail_reasons.append("missing lighter bid or grvt ask")
             else:
                 long_diff = self.lighter_best_bid - self.grvt_best_ask
-                fee_buffer_long = self.calculate_fee_buffer(self.grvt_best_ask, self.lighter_best_bid)
+                fee_buffer_long = self.calculate_fee_buffer(self.grvt_best_ask, self.lighter_best_bid, long_qty)
                 net_long_edge = long_diff - fee_buffer_long
 
                 if spread < long_grvt_threshold:
@@ -1451,11 +1456,15 @@ class HedgeBot:
                     f"grvt pos {self.grvt_position} exceeds max {self.max_position}"
                 )
 
+            short_qty = self.order_quantity
+            if getattr(self, 'grvt_best_bid_size', None):
+                short_qty = min(short_qty, self.grvt_best_bid_size)
+
             if self.grvt_best_bid is None or self.lighter_best_ask is None:
                 short_fail_reasons.append("missing grvt bid or lighter ask")
             else:
                 short_diff = self.grvt_best_bid - self.lighter_best_ask
-                fee_buffer_short = self.calculate_fee_buffer(self.grvt_best_bid, self.lighter_best_ask)
+                fee_buffer_short = self.calculate_fee_buffer(self.grvt_best_bid, self.lighter_best_ask, short_qty)
                 net_short_edge = short_diff - fee_buffer_short
                 if short_diff <= short_grvt_threshold:
                     short_fail_reasons.append(
