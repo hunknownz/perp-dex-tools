@@ -11,7 +11,7 @@ import traceback
 import csv
 import statistics
 from decimal import Decimal
-from typing import Tuple
+from typing import Tuple, Optional
 from collections import deque
 
 from lighter.signer_client import SignerClient
@@ -41,13 +41,18 @@ class HedgeBot:
         self.lighter_order_filled = False
         self.current_order = {}
         self.max_position = max_position
-        self.spread_history = deque(maxlen=200)
-        self.spread_window = 200
-        self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '1.2'))
+        self.spread_history = deque(maxlen=1000)
+        self.spread_window = 1000
+        self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '3'))
         self.close_sigma = Decimal(os.getenv('GRVT_CLOSE_SIGMA', '0.4'))
+        self.grvt_fee_rate = Decimal(os.getenv('GRVT_FEE_RATE', '0.00042'))
+        self.lighter_fee_rate = Decimal(os.getenv('LIGHTER_FEE_RATE', '0'))
+        self.slippage_buffer = Decimal(os.getenv('SPREAD_SLIPPAGE_BUFFER', '1'))
+        self.min_absolute_spread = Decimal(os.getenv('GRVT_MIN_ABS_SPREAD', '0'))
 
         self.exp_grvt_price = 0
         self.exp_lighter_price = 0
+        self.current_net_edge: Optional[Decimal] = None
 
         # Initialize logging to file
         os.makedirs("logs", exist_ok=True)
@@ -257,7 +262,7 @@ class HedgeBot:
         if not os.path.exists(self.csv_filename):
             with open(self.csv_filename, 'w', newline='') as csvfile:
                 writer = csv.writer(csvfile)
-                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity', 'expected_price'])
+                writer.writerow(['exchange', 'timestamp', 'side', 'price', 'quantity', 'expected_price', 'net_edge'])
 
     def _initialize_bbo_csv_file(self):
         """Initialize BBO CSV file with headers if it doesn't exist."""
@@ -282,7 +287,7 @@ class HedgeBot:
             ])
             self.bbo_csv_file.flush()  # Ensure header is written immediately
 
-    def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str, expected_price: str):
+    def log_trade_to_csv(self, exchange: str, side: str, price: str, quantity: str, expected_price: str, net_edge: Optional[Decimal]):
         """Log trade details to CSV file."""
         timestamp = datetime.now(pytz.UTC).isoformat()
 
@@ -294,7 +299,8 @@ class HedgeBot:
                 side,
                 price,
                 quantity,
-                expected_price
+                expected_price,
+                str(net_edge) if net_edge is not None else ''
             ])
 
         self.logger.info(f"📊 Trade logged to CSV: {exchange} {side} {quantity} @ {price}")
@@ -392,7 +398,8 @@ class HedgeBot:
                 side=order_data['side'],
                 price=str(order_data['avg_filled_price']),
                 quantity=str(order_data['filled_base_amount']),
-                expected_price=str(self.exp_lighter_price)
+                expected_price=str(self.exp_lighter_price),
+                net_edge=self.current_net_edge
             )
 
             # Mark execution as complete
@@ -492,6 +499,13 @@ class HedgeBot:
         else:
             # For sell orders, decrease price to improve fill probability
             return original_price - adjustment
+
+    def calculate_fee_buffer(self, grvt_price: Decimal, lighter_price: Decimal) -> Decimal:
+        """Estimate per-unit spread consumed by fees and slippage."""
+        if grvt_price is None or lighter_price is None:
+            return Decimal('0')
+        fee_component = (grvt_price * self.grvt_fee_rate) + (lighter_price * self.lighter_fee_rate)
+        return fee_component + self.slippage_buffer
 
     async def request_fresh_snapshot(self, ws):
         """Request fresh order book snapshot."""
@@ -968,7 +982,8 @@ class HedgeBot:
                             side=side,
                             price=str(price),
                             quantity=str(filled_size),
-                            expected_price=str(self.exp_grvt_price)
+                            expected_price=str(self.exp_grvt_price),
+                            net_edge=self.current_net_edge
                         )
                 elif self.grvt_order_status != 'FILLED':
                     if status == 'OPEN':
@@ -1369,6 +1384,8 @@ class HedgeBot:
             long_grvt = False
             short_grvt = False
             spread = self.lighter_best_bid - self.grvt_best_bid
+            net_long_edge = None
+            net_short_edge = None
 
             close_long = (
                 close_upper is not None and
@@ -1390,6 +1407,7 @@ class HedgeBot:
                     self.grvt_best_bid_size,
                     abs(self.grvt_position)
                 )
+                self.current_net_edge = None
                 await self.execute_pair('sell', 'buy', order_quantity, context='close_long')
                 continue
 
@@ -1399,6 +1417,7 @@ class HedgeBot:
                     self.grvt_best_ask_size,
                     abs(self.grvt_position)
                 )
+                self.current_net_edge = None
                 await self.execute_pair('buy', 'sell', order_quantity, context='close_short')
                 continue
 
@@ -1412,9 +1431,20 @@ class HedgeBot:
                 long_fail_reasons.append("missing lighter bid or grvt ask")
             else:
                 long_diff = self.lighter_best_bid - self.grvt_best_ask
-                if long_diff <= long_grvt_threshold:
+                fee_buffer_long = self.calculate_fee_buffer(self.grvt_best_ask, self.lighter_best_bid)
+                net_long_edge = long_diff - fee_buffer_long
+
+                if spread < long_grvt_threshold:
                     long_fail_reasons.append(
-                        f"spread {float(long_diff):.6f} <= long_thr {float(long_grvt_threshold):.6f}"
+                        f"spread_bb {float(spread):.6f} < long_thr {float(long_grvt_threshold):.6f}"
+                    )
+                if net_long_edge <= 0:
+                    long_fail_reasons.append(
+                        f"net_edge {float(net_long_edge):.6f} <= 0 after fees"
+                    )
+                elif net_long_edge < self.min_absolute_spread:
+                    long_fail_reasons.append(
+                        f"net_edge {float(net_long_edge):.6f} < min_abs {float(self.min_absolute_spread):.6f}"
                     )
             if self.grvt_position > self.max_position:
                 long_fail_reasons.append(
@@ -1425,9 +1455,19 @@ class HedgeBot:
                 short_fail_reasons.append("missing grvt bid or lighter ask")
             else:
                 short_diff = self.grvt_best_bid - self.lighter_best_ask
+                fee_buffer_short = self.calculate_fee_buffer(self.grvt_best_bid, self.lighter_best_ask)
+                net_short_edge = short_diff - fee_buffer_short
                 if short_diff <= short_grvt_threshold:
                     short_fail_reasons.append(
                         f"spread {float(short_diff):.6f} <= short_thr {float(short_grvt_threshold):.6f}"
+                    )
+                if net_short_edge <= 0:
+                    short_fail_reasons.append(
+                        f"net_edge {float(net_short_edge):.6f} <= 0 after fees"
+                    )
+                elif net_short_edge < self.min_absolute_spread:
+                    short_fail_reasons.append(
+                        f"net_edge {float(net_short_edge):.6f} < min_abs {float(self.min_absolute_spread):.6f}"
                     )
             if self.grvt_position < -1 * self.max_position:
                 short_fail_reasons.append(
@@ -1437,10 +1477,12 @@ class HedgeBot:
             if not long_fail_reasons:
                 self.exp_grvt_price = self.grvt_best_ask
                 self.exp_lighter_price = self.lighter_best_bid
+                self.current_net_edge = net_long_edge
                 long_grvt = True
             elif not short_fail_reasons:
                 self.exp_grvt_price = self.grvt_best_bid
                 self.exp_lighter_price = self.lighter_best_ask
+                self.current_net_edge = net_short_edge
                 short_grvt = True
 
             if long_grvt:
@@ -1455,9 +1497,12 @@ class HedgeBot:
                 self.logger.info(
                     f"No trade | spread_bb={float(spread):.6f}, long_diff={float(long_diff) if long_diff is not None else 'N/A'}, "
                     f"short_diff={float(short_diff) if short_diff is not None else 'N/A'}, "
+                    f"net_long={float(net_long_edge) if net_long_edge is not None else 'N/A'}, "
+                    f"net_short={float(net_short_edge) if net_short_edge is not None else 'N/A'}, "
                     f"long_thr={float(long_grvt_threshold):.6f}, short_thr={float(short_grvt_threshold):.6f}, "
                     f"close_upper={float(close_upper) if close_upper is not None else 'N/A'}, "
                     f"close_lower={float(close_lower) if close_lower is not None else 'N/A'}, "
+                    f"min_abs={float(self.min_absolute_spread):.6f}, "
                     f"long_fail={'; '.join(long_fail_reasons) if long_fail_reasons else 'n/a'}, "
                     f"short_fail={'; '.join(short_fail_reasons) if short_fail_reasons else 'n/a'}, "
                     f"GRVT pos={self.grvt_position}, Lighter pos={self.lighter_position}"
