@@ -35,9 +35,15 @@ class HedgeBot:
     """Trading bot that places post-only orders on GRVT and hedges with market orders on Lighter."""
 
     def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 3, max_position: Decimal = Decimal('0')):
+        # Allow env var to override argument
+        env_timeout = os.getenv('FILL_TIMEOUT')
+        if env_timeout:
+            self.fill_timeout = int(env_timeout)
+        else:
+            self.fill_timeout = fill_timeout
+            
         self.ticker = ticker
         self.order_quantity = order_quantity
-        self.fill_timeout = fill_timeout
         self.lighter_order_filled = False
         self.current_order = {}
         self.max_position = max_position
@@ -1108,29 +1114,172 @@ class HedgeBot:
                     proceed = False
 
         if not proceed:
-            self.logger.warning(f"[{context}] ⚠️ HEDGE ABORTED. Unwinding position...")
-            unwind_side = 'sell' if grvt_side.lower() == 'buy' else 'buy'
-            try:
-                await self.place_grvt_market_order(unwind_side, filled_qty)
-                self.logger.info(f"[{context}] 🔄 Unwound GRVT position.")
-            except Exception as unwind_err:
-                self.logger.error(f"[{context}] ❌ Failed to unwind GRVT leg after edge loss: {unwind_err}")
-            return False
+            if net_edge_after_fill is not None:
+                self.logger.info(f"[{context}] ⚠️ Proceeding with hedge despite degraded edge: {net_edge_after_fill}")
+            else:
+                 self.logger.info(f"[{context}] ⚠️ Proceeding with hedge (edge unknown)")
 
-        self.current_net_edge = net_edge_after_fill
-
+        # Execute Hedge on Lighter (Market Taker)
         try:
             await self.place_lighter_market_order(lighter_side, filled_qty)
+            self.lighter_order_filled = True
+            
+            # Log Trade
+            msg = f"[{context}] 🚀 ARBITRAGE DONE! {filled_qty} @ GRVT {grvt_side} / Lighter {lighter_side}"
+            if net_edge_after_fill is not None:
+                msg += f" | Net Edge: {net_edge_after_fill:.4f}"
+            self.logger.info(msg)
             return True
+
         except Exception as e:
-            self.logger.error(f"[{context}] ❌ Lighter leg failed: {e}")
-            unwind_side = 'sell' if grvt_side.lower() == 'buy' else 'buy'
-            try:
-                await self.place_grvt_market_order(unwind_side, filled_qty)
-                self.logger.warning(f"[{context}] ⚠️ Lighter leg failed - unwound GRVT leg with {unwind_side} {filled_qty}")
-            except Exception as unwind_err:
-                self.logger.error(f"[{context}] ❌ Failed to unwind GRVT leg: {unwind_err}")
+            self.logger.error(f"[{context}] ❌ Hedge Failed on Lighter: {e}")
+            # Emergency Unwind logic could go here
             return False
+
+    async def execute_close_pair(self, grvt_side: str, lighter_side: str, quantity: Decimal, threshold: Decimal, context: str) -> bool:
+        """
+        Execute GRVT Maker Close (Limit) -> Lighter Taker Close (Market).
+        Active monitoring to chase the close if spread remains favorable.
+        """
+        self.logger.info(f"[{context}] 📉 STARTING MAKER CLOSE: GRVT {grvt_side} {quantity} (Threshold: {threshold})")
+
+        try:
+             # Initial Order Entry (Post-Only)
+            current_order_id, current_order_price = await self.place_grvt_post_only_order(grvt_side, quantity)
+        except Exception as e:
+            self.logger.error(f"[{context}] ❌ Failed to place GRVT close order: {e}")
+            return False
+
+        self.pending_grvt_order_id = current_order_id
+        self.grvt_filled_size = Decimal('0')
+        self.grvt_order_fill_event.clear()
+
+        # --- Active Close Monitor ---
+        start_time = time.time()
+        filled_qty = Decimal('0')
+        order_finalized = False
+        
+        while not order_finalized:
+            # 1. Timeout
+            if time.time() - start_time > self.fill_timeout:
+                self.logger.warning(f"[{context}] ⏰ Close Timeout, cancelling...")
+                try:
+                    await self.grvt_client.cancel_order(current_order_id)
+                except Exception as e:
+                    self.logger.error(f"[{context}] ❌ Failed to cancel close order: {e}")
+
+                if self.grvt_order_fill_event.is_set():
+                    filled_qty = self.grvt_filled_size
+                else:
+                    return False
+                order_finalized = True
+                break
+
+            # 2. Filled
+            if self.grvt_order_fill_event.is_set():
+                filled_qty = self.grvt_filled_size
+                order_finalized = True
+                break
+
+            # 3. Active Check (Spread Validation & Chasing)
+            try:
+                # Re-calc Spread
+                # Note: 'threshold' passed in is usually close_upper (for Long Close) or close_lower (for Short Close)
+                # We want to Ensure we are STILL within good closing range.
+                
+                valid_close_condition = False
+                should_chase = False
+                
+                if context == 'close_long':
+                    # Long Close: Sell GRVT / Buy Lighter.
+                    # Spread = Bid(Lighter) - Ask(GRVT)
+                    # We want Spread <= Threshold (Mean Reversion).
+                    # 'current_order_price' is our Ask.
+                    curr_lighter = self.lighter_best_bid
+                    curr_grvt_best_ask = self.grvt_best_ask
+                    
+                    if curr_lighter and curr_grvt_best_ask:
+                        # Check validity using OUR price
+                        current_spread = curr_lighter - current_order_price
+                        
+                        # Tolerance: We allow closing even if slightly worse than threshold, 
+                        # but not if it blows out completely. 
+                        # Giving it some buffer? Or strict? 
+                        # User wants profit. Strict is safer.
+                        if current_spread <= threshold + Decimal('5'): # Allow 5U slippage from threshold?
+                            valid_close_condition = True
+                        
+                        # Chase Check
+                        if curr_grvt_best_ask < current_order_price:
+                             # Market moved down, we are too expensive. Chase down.
+                             should_chase = True
+                             potential_new_price = curr_grvt_best_ask
+
+                elif context == 'close_short':
+                    # Short Close: Buy GRVT / Sell Lighter
+                    # Spread = Bid(GRVT) - Ask(Lighter)
+                    # We want Spread >= Threshold.
+                    curr_lighter = self.lighter_best_ask
+                    curr_grvt_best_bid = self.grvt_best_bid
+                    
+                    if curr_lighter and curr_grvt_best_bid:
+                        current_spread = current_order_price - curr_lighter
+                        
+                        if current_spread >= threshold - Decimal('5'):
+                            valid_close_condition = True
+                            
+                        # Chase Check
+                        if curr_grvt_best_bid > current_order_price:
+                            # Market moved up, we are too cheap. Chase up.
+                            should_chase = True
+                            potential_new_price = curr_grvt_best_bid
+
+                # Execution
+                if not valid_close_condition:
+                     self.logger.warning(f"[{context}] 🛡️ Spread worsened beyond threshold! CANCELLING close.")
+                     await self.grvt_client.cancel_order(current_order_id)
+                     if self.grvt_order_fill_event.is_set():
+                        filled_qty = self.grvt_filled_size
+                        order_finalized = True
+                     else:
+                        return False
+                
+                elif should_chase:
+                     self.logger.info(f"[{context}] 🏃 Chasing Close! {current_order_price} -> {potential_new_price}")
+                     try:
+                        await self.grvt_client.cancel_order(current_order_id)
+                     except: 
+                        pass
+                     
+                     if self.grvt_order_fill_event.is_set():
+                        filled_qty = self.grvt_filled_size
+                        order_finalized = True
+                     else:
+                        new_id, new_price = await self.place_grvt_post_only_order(grvt_side, quantity)
+                        current_order_id = new_id
+                        current_order_price = new_price
+                        self.pending_grvt_order_id = new_id
+                        start_time = time.time()
+
+            except Exception as e:
+                self.logger.error(f"[{context}] Monitor Error: {e}")
+            
+            if order_finalized: 
+                break
+            await asyncio.sleep(0.05)
+        
+        # --- Hedge on Lighter ---
+        if filled_qty > 0:
+            self.logger.info(f"[{context}] ✅ GRVT Closed {filled_qty}! Hedging on Lighter...")
+            try:
+                await self.place_lighter_market_order(lighter_side, filled_qty)
+                self.logger.info(f"[{context}] 🏁 POSITION CLOSED.")
+                return True
+            except Exception as e:
+                self.logger.error(f"[{context}] ❌ Lighter Hedge Failed: {e}")
+                return False
+        
+        return False
 
     async def monitor_lighter_order(self, client_order_index: int):
         """Monitor Lighter order and adjust price if needed."""
@@ -1653,16 +1802,9 @@ class HedgeBot:
                 )
                 self.current_net_edge = None
                 try:
-                    await self.place_grvt_market_order('sell', order_quantity)
+                    await self.execute_close_pair('sell', 'buy', order_quantity, close_upper, context='close_long')
                 except Exception as e:
-                    self.logger.error(f"[close_long] ❌ GRVT market close failed: {e}")
-                    continue
-
-                try:
-                    await self.place_lighter_market_order('buy', order_quantity)
-                except Exception as e:
-                    self.logger.error(f"[close_long] ❌ Lighter market close failed: {e}")
-                    continue
+                    self.logger.error(f"[close_long] ❌ Close failed: {e}")
                 continue
 
             if close_short:
@@ -1673,16 +1815,9 @@ class HedgeBot:
                 )
                 self.current_net_edge = None
                 try:
-                    await self.place_grvt_market_order('buy', order_quantity)
+                    await self.execute_close_pair('buy', 'sell', order_quantity, close_lower, context='close_short')
                 except Exception as e:
-                    self.logger.error(f"[close_short] ❌ GRVT market close failed: {e}")
-                    continue
-
-                try:
-                    await self.place_lighter_market_order('sell', order_quantity)
-                except Exception as e:
-                    self.logger.error(f"[close_short] ❌ Lighter market close failed: {e}")
-                    continue
+                    self.logger.error(f"[close_short] ❌ Close failed: {e}")
                 continue
 
             long_fail_reasons = []
