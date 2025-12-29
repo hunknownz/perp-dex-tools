@@ -200,6 +200,9 @@ class HedgeBot:
         self.grvt_private_key = os.getenv('GRVT_PRIVATE_KEY')
         self.grvt_api_key = os.getenv('GRVT_API_KEY')
         self.grvt_environment = os.getenv('GRVT_ENVIRONMENT', 'prod')
+        self.pending_grvt_order_id = None
+        self.grvt_filled_size = Decimal('0')
+        self.grvt_order_fill_event = asyncio.Event()
 
     def shutdown(self, signum=None, frame=None):
         """Synchronous shutdown handler (called by signal handler)."""
@@ -873,23 +876,57 @@ class HedgeBot:
             self.logger.error(f"❌ Error placing Lighter order: {e}")
             return None
 
-    async def execute_pair(self, grvt_side: str, lighter_side: str, quantity: Decimal, context: str) -> bool:
-        """Execute GRVT leg first, then Lighter leg to avoid single-sided exposure."""
+    async def wait_for_grvt_fill(self, order_id: str, quantity: Decimal) -> Decimal:
+        """Wait for GRVT limit order fill or timeout."""
         try:
-            await self.place_grvt_market_order(grvt_side, quantity)
+            await asyncio.wait_for(self.grvt_order_fill_event.wait(), timeout=self.fill_timeout)
+            filled = self.grvt_filled_size
+            if filled <= 0:
+                self.logger.error(f"GRVT order {order_id} reported zero fill")
+            elif filled < quantity:
+                self.logger.warning(f"GRVT order {order_id} partially filled: {filled}/{quantity}")
+            return filled
+        except asyncio.TimeoutError:
+            self.logger.error(f"Timeout waiting for GRVT order {order_id} fill")
+            try:
+                cancel_result = await self.grvt_client.cancel_order(order_id)
+                if cancel_result.success:
+                    self.logger.warning(f"Cancelled GRVT order {order_id} after timeout")
+                else:
+                    self.logger.error(f"Failed to cancel GRVT order {order_id}: {cancel_result.error_message}")
+            except Exception as cancel_err:
+                self.logger.error(f"Error cancelling GRVT order {order_id}: {cancel_err}")
+            return Decimal('0')
+        finally:
+            self.pending_grvt_order_id = None
+            self.grvt_order_fill_event.clear()
+
+    async def execute_pair(self, grvt_side: str, lighter_side: str, quantity: Decimal, context: str) -> bool:
+        """Execute GRVT post-only limit first, then hedge on Lighter."""
+        try:
+            order_id = await self.place_grvt_post_only_order(grvt_side, quantity)
         except Exception as e:
-            self.logger.error(f"[{context}] ❌ GRVT leg failed: {e}")
+            self.logger.error(f"[{context}] ❌ Failed to place GRVT limit order: {e}")
+            return False
+
+        self.pending_grvt_order_id = order_id
+        self.grvt_filled_size = Decimal('0')
+        self.grvt_order_fill_event.clear()
+
+        filled_qty = await self.wait_for_grvt_fill(order_id, quantity)
+        if filled_qty <= 0:
+            self.logger.error(f"[{context}] ❌ GRVT limit order not filled")
             return False
 
         try:
-            await self.place_lighter_market_order(lighter_side, quantity)
+            await self.place_lighter_market_order(lighter_side, filled_qty)
             return True
         except Exception as e:
             self.logger.error(f"[{context}] ❌ Lighter leg failed: {e}")
             unwind_side = 'sell' if grvt_side.lower() == 'buy' else 'buy'
             try:
-                await self.place_grvt_market_order(unwind_side, quantity)
-                self.logger.warning(f"[{context}] ⚠️ Lighter leg failed - unwound GRVT leg with {unwind_side} {quantity}")
+                await self.place_grvt_market_order(unwind_side, filled_qty)
+                self.logger.warning(f"[{context}] ⚠️ Lighter leg failed - unwound GRVT leg with {unwind_side} {filled_qty}")
             except Exception as unwind_err:
                 self.logger.error(f"[{context}] ❌ Failed to unwind GRVT leg: {unwind_err}")
             return False
@@ -967,6 +1004,11 @@ class HedgeBot:
                 
                 if status == 'CANCELED' and filled_size > 0:
                     status = 'FILLED'
+
+                if self.pending_grvt_order_id and order_id == self.pending_grvt_order_id and status == 'FILLED':
+                    self.grvt_filled_size = filled_size
+                    if not self.grvt_order_fill_event.is_set():
+                        self.grvt_order_fill_event.set()
 
                 # Handle the order update
                 if status == 'FILLED' and self.grvt_order_status != 'FILLED':
