@@ -918,6 +918,40 @@ class HedgeBot:
             self.logger.error(f"[{context}] ❌ GRVT limit order not filled")
             return False
 
+        net_edge_after_fill = None
+        proceed = True
+        if grvt_side.lower() == 'buy':
+            if self.lighter_best_bid is None or self.grvt_best_ask is None:
+                self.logger.error(f"[{context}] ❌ Missing order book data after GRVT fill")
+                proceed = False
+            else:
+                long_diff = self.lighter_best_bid - self.grvt_best_ask
+                fee_buf = self.calculate_fee_buffer(self.grvt_best_ask, self.lighter_best_bid, filled_qty)
+                net_edge_after_fill = long_diff - fee_buf
+                if net_edge_after_fill <= 0 or net_edge_after_fill < self.min_absolute_spread:
+                    proceed = False
+        else:
+            if self.grvt_best_bid is None or self.lighter_best_ask is None:
+                self.logger.error(f"[{context}] ❌ Missing order book data after GRVT fill")
+                proceed = False
+            else:
+                short_diff = self.grvt_best_bid - self.lighter_best_ask
+                fee_buf = self.calculate_fee_buffer(self.grvt_best_bid, self.lighter_best_ask, filled_qty)
+                net_edge_after_fill = short_diff - fee_buf
+                if net_edge_after_fill <= 0 or net_edge_after_fill < self.min_absolute_spread:
+                    proceed = False
+
+        if not proceed:
+            self.logger.warning(f"[{context}] ⚠️ Net edge vanished after GRVT fill ({net_edge_after_fill}), unwinding")
+            unwind_side = 'sell' if grvt_side.lower() == 'buy' else 'buy'
+            try:
+                await self.place_grvt_market_order(unwind_side, filled_qty)
+            except Exception as unwind_err:
+                self.logger.error(f"[{context}] ❌ Failed to unwind GRVT leg after edge loss: {unwind_err}")
+            return False
+
+        self.current_net_edge = net_edge_after_fill
+
         try:
             await self.place_lighter_market_order(lighter_side, filled_qty)
             return True
