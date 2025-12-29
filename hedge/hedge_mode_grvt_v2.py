@@ -45,7 +45,9 @@ class HedgeBot:
         self.spread_window = 1000
         self.open_sigma = Decimal(os.getenv('GRVT_OPEN_SIGMA', '3'))
         self.close_sigma = Decimal(os.getenv('GRVT_CLOSE_SIGMA', '0.4'))
-        self.grvt_fee_rate = Decimal(os.getenv('GRVT_FEE_RATE', '0'))
+        self.grvt_open_fee_rate = Decimal(os.getenv('GRVT_OPEN_FEE_RATE', '0'))
+        self.grvt_close_fee_rate = Decimal(os.getenv('GRVT_CLOSE_FEE_RATE', '0.00039'))
+        self.grvt_fee_rate = self.grvt_open_fee_rate + self.grvt_close_fee_rate
         self.lighter_fee_rate = Decimal(os.getenv('LIGHTER_FEE_RATE', '0'))
         self.slippage_buffer = Decimal(os.getenv('SPREAD_SLIPPAGE_BUFFER', '1'))
         self.min_absolute_spread = Decimal(os.getenv('GRVT_MIN_ABS_SPREAD', '0'))
