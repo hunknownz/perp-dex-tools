@@ -821,7 +821,7 @@ class HedgeBot:
         if not order_result.success:
             raise Exception(f"Failed to place order: {order_result.error_message}")
 
-        return order_result.order_id
+        return order_result.order_id, order_price
 
     async def place_lighter_market_order(self, lighter_side: str, quantity: Decimal):
         if not self.lighter_client:
@@ -906,35 +906,36 @@ class HedgeBot:
     async def execute_pair(self, grvt_side: str, lighter_side: str, quantity: Decimal, context: str) -> bool:
         """Execute GRVT post-only limit first, then hedge on Lighter."""
         try:
-            order_id = await self.place_grvt_post_only_order(grvt_side, quantity)
+            # Place the order
+            current_order_id, current_order_price = await self.place_grvt_post_only_order(grvt_side, quantity)
         except Exception as e:
             self.logger.error(f"[{context}] ❌ Failed to place GRVT limit order: {e}")
             return False
 
-        self.pending_grvt_order_id = order_id
+        self.pending_grvt_order_id = current_order_id
         self.grvt_filled_size = Decimal('0')
         self.grvt_order_fill_event.clear()
-
+        
         # --- Active Order Management Loop ---
         start_time = time.time()
         filled_qty = Decimal('0')
-        order_finalized = False  # True if filled or cancelled
+        order_finalized = False # True if filled or cancelled
 
         while not order_finalized:
             # 1. Check for timeout
             if time.time() - start_time > self.fill_timeout:
                 self.logger.warning(f"[{context}] ⏰ Timeout waiting for fill, cancelling...")
                 try:
-                    await self.grvt_client.cancel_order(order_id)
+                    await self.grvt_client.cancel_order(current_order_id)
                 except Exception as e:
                     self.logger.error(f"[{context}] ❌ Failed to cancel on timeout: {e}")
-
+                
                 # Double check fill after cancel attempt (race condition)
                 if self.grvt_order_fill_event.is_set():
-                    filled_qty = self.grvt_filled_size
-                    self.logger.info(f"[{context}] ⚠️ Order filled during cancel race!")
+                     filled_qty = self.grvt_filled_size
+                     self.logger.info(f"[{context}] ⚠️ Order filled during cancel race!")
                 else:
-                    return False  # Clean exit on timeout
+                    return False # Clean exit on timeout
                 order_finalized = True
                 break
 
@@ -948,60 +949,118 @@ class HedgeBot:
             try:
                 # Check current edge
                 if grvt_side.lower() == 'buy':
-                    # We are bidding on GRVT. If Lighter asks (where we sell) drop, our edge shrinks.
+                    # We are bidding on GRVT.
                     current_lighter_hedge_price = self.lighter_best_bid
+                    current_grvt_best_bid = self.grvt_best_bid
 
-                    if current_lighter_hedge_price is None or self.grvt_best_bid is None:
-                        pass
+                    if current_lighter_hedge_price is None or current_grvt_best_bid is None:
+                        pass 
                     else:
-                        # Use current best bid as proxy for our order price if we are at top of book
-                        estimated_my_price = self.grvt_best_bid
-
-                        # Edge = Sell Price (Lighter) - Buy Price (GRVT)
-                        current_edge = current_lighter_hedge_price - estimated_my_price
-
-                        # Apply Fee Buffer
-                        fee_buf = self.calculate_fee_buffer(estimated_my_price, current_lighter_hedge_price, quantity)
+                        # Logic 1: Protection (Cancel if Edge Vanishes)
+                        # We use 'current_order_price' because that's our committed price
+                        current_edge = current_lighter_hedge_price - current_order_price
+                        
+                        fee_buf = self.calculate_fee_buffer(current_order_price, current_lighter_hedge_price, quantity)
                         net_edge = current_edge - fee_buf
-
+                        
                         if net_edge < self.min_absolute_spread:
                             self.logger.warning(f"[{context}] 🛡️ Edge vanished! ({net_edge:.4f} < {self.min_absolute_spread}), CANCELLING")
-                            await self.grvt_client.cancel_order(order_id)
+                            await self.grvt_client.cancel_order(current_order_id)
                             # Wait small moment to see if it filled during cancel
-                            await asyncio.sleep(0.1)
+                            await asyncio.sleep(0.1) 
                             if self.grvt_order_fill_event.is_set():
                                 filled_qty = self.grvt_filled_size
                                 self.logger.warning(f"[{context}] ⚠️ Filled during cancellation!")
                                 order_finalized = True
                             else:
                                 return False
-
-                else:  # Selling on GRVT (Open Short)
-                    # We Sell GRVT (Maker) -> Hedge Buy Lighter (Taker)
-                    # Edge = Sell Price (GRVT) - Buy Price (Lighter)
+                        
+                        # Logic 2: Chasing (Replace if we are behind)
+                        # If market moved UP (Best Bid > My Price), we are behind.
+                        # We want to catch up IF it's safe.
+                        elif current_grvt_best_bid > current_order_price:
+                            # Verify if chasing is safe (Spread check at NEW price)
+                            # New price would be current_grvt_best_bid (Join the best bid)
+                            potential_new_price = current_grvt_best_bid
+                            potential_edge = current_lighter_hedge_price - potential_new_price
+                            potential_net_edge = potential_edge - fee_buf
+                            
+                            if potential_net_edge >= self.min_absolute_spread:
+                                self.logger.info(f"[{context}] 🏃 Chasing Market! {current_order_price} -> {potential_new_price} (Edge: {potential_net_edge:.2f})")
+                                # Cancel Old
+                                try:
+                                    await self.grvt_client.cancel_order(current_order_id)
+                                except Exception as e:
+                                    self.logger.error(f"Failed to cancel for chase: {e}")
+                                    
+                                if self.grvt_order_fill_event.is_set():
+                                    filled_qty = self.grvt_filled_size
+                                    order_finalized = True
+                                else:
+                                    # Place New
+                                    try:
+                                        new_id, new_price = await self.place_grvt_post_only_order(grvt_side, quantity)
+                                        current_order_id = new_id
+                                        current_order_price = new_price
+                                        self.pending_grvt_order_id = new_id
+                                        # Reset timer for the new attempt? 
+                                        # Strategy choice: Extending timeout to give the chase a chance.
+                                        start_time = time.time() 
+                                    except Exception as e:
+                                        self.logger.error(f"Failed to place chase order: {e}")
+                                        return False # Abort if replacement fails
+                                
+                else: # Selling on GRVT (Open Short)
                     current_lighter_hedge_price = self.lighter_best_ask
-
-                    if current_lighter_hedge_price is None or self.grvt_best_ask is None:
-                        pass
+                    current_grvt_best_ask = self.grvt_best_ask
+                    
+                    if current_lighter_hedge_price is None or current_grvt_best_ask is None:
+                         pass
                     else:
-                        estimated_my_price = self.grvt_best_ask
-
-                        current_edge = estimated_my_price - current_lighter_hedge_price
-
-                        fee_buf = self.calculate_fee_buffer(estimated_my_price, current_lighter_hedge_price, quantity)
+                        # Logic 1: Protection
+                        current_edge = current_order_price - current_lighter_hedge_price
+                        
+                        fee_buf = self.calculate_fee_buffer(current_order_price, current_lighter_hedge_price, quantity)
                         net_edge = current_edge - fee_buf
-
+                        
                         if net_edge < self.min_absolute_spread:
                             self.logger.warning(f"[{context}] 🛡️ Edge vanished! ({net_edge:.4f} < {self.min_absolute_spread}), CANCELLING")
-                            await self.grvt_client.cancel_order(order_id)
-                            # Wait small moment to see if it filled during cancel
-                            await asyncio.sleep(0.1)
+                            await self.grvt_client.cancel_order(current_order_id)
+                            await asyncio.sleep(0.1) 
                             if self.grvt_order_fill_event.is_set():
                                 filled_qty = self.grvt_filled_size
                                 self.logger.warning(f"[{context}] ⚠️ Filled during cancellation!")
                                 order_finalized = True
                             else:
                                 return False
+
+                        # Logic 2: Chasing (Replace if we are behind)
+                        # If market moved DOWN (Best Ask < My Price), we are behind (too expensive).
+                        elif current_grvt_best_ask < current_order_price:
+                            potential_new_price = current_grvt_best_ask
+                            potential_edge = potential_new_price - current_lighter_hedge_price
+                            potential_net_edge = potential_edge - fee_buf
+                            
+                            if potential_net_edge >= self.min_absolute_spread:
+                                self.logger.info(f"[{context}] 🏃 Chasing Market! {current_order_price} -> {potential_new_price} (Edge: {potential_net_edge:.2f})")
+                                try:
+                                    await self.grvt_client.cancel_order(current_order_id)
+                                except Exception as e:
+                                    self.logger.error(f"Failed to cancel for chase: {e}")
+
+                                if self.grvt_order_fill_event.is_set():
+                                    filled_qty = self.grvt_filled_size
+                                    order_finalized = True
+                                else:
+                                    try:
+                                        new_id, new_price = await self.place_grvt_post_only_order(grvt_side, quantity)
+                                        current_order_id = new_id
+                                        current_order_price = new_price
+                                        self.pending_grvt_order_id = new_id
+                                        start_time = time.time()
+                                    except Exception as e:
+                                        self.logger.error(f"Failed to place chase order: {e}")
+                                        return False
 
             except Exception as e:
                 self.logger.error(f"[{context}] Error in active monitoring: {e}")
@@ -1009,9 +1068,10 @@ class HedgeBot:
 
             if order_finalized:
                 break
-
+                
             # Sleep small amount to prevent CPU spin
             await asyncio.sleep(0.05)
+
 
         # --- End Active Monitor ---
 
