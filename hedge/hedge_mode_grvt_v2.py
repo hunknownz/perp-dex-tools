@@ -1485,7 +1485,17 @@ class HedgeBot:
                     abs(self.grvt_position)
                 )
                 self.current_net_edge = None
-                await self.execute_pair('sell', 'buy', order_quantity, context='close_long')
+                try:
+                    await self.place_grvt_market_order('sell', order_quantity)
+                except Exception as e:
+                    self.logger.error(f"[close_long] ❌ GRVT market close failed: {e}")
+                    continue
+
+                try:
+                    await self.place_lighter_market_order('buy', order_quantity)
+                except Exception as e:
+                    self.logger.error(f"[close_long] ❌ Lighter market close failed: {e}")
+                    continue
                 continue
 
             if close_short:
@@ -1495,7 +1505,17 @@ class HedgeBot:
                     abs(self.grvt_position)
                 )
                 self.current_net_edge = None
-                await self.execute_pair('buy', 'sell', order_quantity, context='close_short')
+                try:
+                    await self.place_grvt_market_order('buy', order_quantity)
+                except Exception as e:
+                    self.logger.error(f"[close_short] ❌ GRVT market close failed: {e}")
+                    continue
+
+                try:
+                    await self.place_lighter_market_order('sell', order_quantity)
+                except Exception as e:
+                    self.logger.error(f"[close_short] ❌ Lighter market close failed: {e}")
+                    continue
                 continue
 
             long_fail_reasons = []
