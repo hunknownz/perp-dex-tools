@@ -34,7 +34,7 @@ class Config:
 class HedgeBot:
     """Trading bot that places post-only orders on GRVT and hedges with market orders on Lighter."""
 
-    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 5, max_position: Decimal = Decimal('0')):
+    def __init__(self, ticker: str, order_quantity: Decimal, fill_timeout: int = 3, max_position: Decimal = Decimal('0')):
         self.ticker = ticker
         self.order_quantity = order_quantity
         self.fill_timeout = fill_timeout
