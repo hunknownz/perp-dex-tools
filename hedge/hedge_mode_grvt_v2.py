@@ -1031,13 +1031,22 @@ class HedgeBot:
                         
                         if net_edge < self.min_absolute_spread:
                             self.logger.warning(f"[{context}] 🛡️ Edge vanished! ({net_edge:.4f} < {self.min_absolute_spread}), CANCELLING")
-                            await self.grvt_client.cancel_order(current_order_id)
-                            await asyncio.sleep(0.1) 
-                            if self.grvt_order_fill_event.is_set():
+                            
+                            try:
+                                await self.grvt_client.cancel_order(current_order_id)
+                            except Exception as e:
+                                self.logger.warning(f"[{context}] Cancel failed (might be filled): {e}")
+
+                            # Wait for potential fill update via WS
+                            await asyncio.sleep(0.5) 
+                            
+                            if self.grvt_order_fill_event.is_set() or self.grvt_filled_size > 0:
                                 filled_qty = self.grvt_filled_size
-                                self.logger.warning(f"[{context}] ⚠️ Filled during cancellation!")
+                                self.logger.warning(f"[{context}] ⚠️ Order filled during cancellation race! Proceeding to hedge.")
                                 order_finalized = True
                             else:
+                                # Double check order status via API if possible? 
+                                # For now, assume cancelled if not filled after wait
                                 return False
 
                         # Logic 2: Chasing (Replace if we are behind)
@@ -1237,9 +1246,18 @@ class HedgeBot:
                 # Execution
                 if not valid_close_condition:
                      self.logger.warning(f"[{context}] 🛡️ Spread worsened beyond threshold! CANCELLING close.")
-                     await self.grvt_client.cancel_order(current_order_id)
-                     if self.grvt_order_fill_event.is_set():
+                     
+                     try:
+                        await self.grvt_client.cancel_order(current_order_id)
+                     except Exception as e:
+                        self.logger.warning(f"[{context}] Cancel failed (might be filled): {e}")
+                     
+                     # Wait for potential fill update
+                     await asyncio.sleep(0.5)
+
+                     if self.grvt_order_fill_event.is_set() or self.grvt_filled_size > 0:
                         filled_qty = self.grvt_filled_size
+                        self.logger.warning(f"[{context}] ⚠️ Order filled during cancellation race! Proceeding to hedge.")
                         order_finalized = True
                      else:
                         return False
