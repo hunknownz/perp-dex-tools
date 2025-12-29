@@ -1268,16 +1268,24 @@ class HedgeBot:
                 break
             await asyncio.sleep(0.05)
         
-        # --- Hedge on Lighter ---
+        # --- Hedge on Lighter (with Retry) ---
         if filled_qty > 0:
             self.logger.info(f"[{context}] ✅ GRVT Closed {filled_qty}! Hedging on Lighter...")
-            try:
-                await self.place_lighter_market_order(lighter_side, filled_qty)
-                self.logger.info(f"[{context}] 🏁 POSITION CLOSED.")
-                return True
-            except Exception as e:
-                self.logger.error(f"[{context}] ❌ Lighter Hedge Failed: {e}")
-                return False
+            
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await self.place_lighter_market_order(lighter_side, filled_qty)
+                    self.logger.info(f"[{context}] 🏁 POSITION CLOSED.")
+                    return True
+                except Exception as e:
+                    self.logger.error(f"[{context}] ❌ Lighter Hedge Failed (Attempt {attempt+1}/{max_retries}): {e}")
+                    if attempt < max_retries - 1:
+                        await asyncio.sleep(0.5)  # Wait before retry
+                    else:
+                        self.logger.critical(f"[{context}] 🚨 CRITICAL: FAILED TO CLOSE LIGHTER POSITION AFTER {max_retries} ATTEMPTS!")
+                        # TODO: Send alert to user?
+                        return False
         
         return False
 
